@@ -1,0 +1,1437 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<title>Тетріс 3D (WebGL)</title>
+<style>
+  body {
+    margin: 0;
+    background: #000;
+    color: #eee;
+    font-family: monospace;
+    overflow: hidden;
+    height: 100vh;
+  }
+  canvas#gl { position: absolute; inset: 0; display: block; }
+  .panel {
+    position: absolute; top: 20px; left: 20px;
+    background: rgba(10, 10, 30, 0.7);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 204, 0, 0.3);
+    border-radius: 12px; padding: 16px 20px; z-index: 10;
+  }
+  .panel h1 {
+    margin: 0 0 12px; font-size: 22px; color: #ffcc00;
+    text-shadow: 0 0 10px rgba(255, 204, 0, 0.5); letter-spacing: 2px;
+  }
+  .panel .stat { line-height: 1.7; font-size: 14px; }
+  .panel .stat b { color: #ffcc00; }
+  .next-panel {
+    position: absolute; top: 20px; right: 20px;
+    background: rgba(10, 10, 30, 0.7); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 204, 0, 0.3); border-radius: 12px;
+    padding: 12px; z-index: 10;
+  }
+  .next-panel div:first-child { text-align: center; color: #ffcc00; font-size: 12px; margin-bottom: 6px; letter-spacing: 1px; }
+  .controls {
+    position: absolute; bottom: 20px; left: 20px;
+    background: rgba(10, 10, 30, 0.7); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px;
+    padding: 12px 16px; font-size: 12px; color: #bbb; line-height: 1.6; z-index: 10;
+  }
+  .controls b { color: #ffcc00; }
+  .badge {
+    position: absolute; bottom: 20px; right: 20px;
+    background: rgba(10, 10, 30, 0.7); backdrop-filter: blur(8px);
+    border: 1px solid rgba(0, 240, 240, 0.4); border-radius: 12px;
+    padding: 8px 14px; font-size: 11px; color: #00f0f0; z-index: 10;
+  }
+  .overlay {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center; z-index: 20; pointer-events: none;
+  }
+  .overlay.show { display: flex; }
+  .overlay .msg {
+    background: rgba(0, 0, 0, 0.8); border: 2px solid #ff4444;
+    border-radius: 12px; padding: 30px 50px; text-align: center;
+  }
+  .overlay h2 { margin: 0 0 10px; color: #ff4444; font-size: 36px; letter-spacing: 4px; text-shadow: 0 0 20px rgba(255, 68, 68, 0.7); }
+  .overlay.pause h2 { color: #ffcc00; }
+  .overlay.pause .msg { border-color: #ffcc00; }
+</style>
+</head>
+<body>
+  <canvas id="gl"></canvas>
+
+  <div class="panel">
+    <h1>ТЕТРІС 3D</h1>
+    <div class="stat">Рахунок: <b id="score">0</b></div>
+    <div class="stat">Лінії: <b id="lines">0</b></div>
+    <div class="stat">Рівень: <b id="level">1</b></div>
+  </div>
+
+  <div class="next-panel">
+    <div>НАСТУПНА</div>
+    <canvas id="nextCanvas" width="140" height="140"></canvas>
+  </div>
+
+  <div class="controls">
+    <b>← →</b> рух &nbsp; <b>↑</b> поворот &nbsp; <b>↓</b> вниз<br>
+    <b>Пробіл</b> скинути &nbsp; <b>P</b> пауза &nbsp; <b>R</b> рестарт<br>
+    <b>Миша</b> обертати камеру &nbsp; <b>Колесо</b> зум
+  </div>
+
+  <div class="badge">⚡ Pure WebGL · custom GLSL shaders</div>
+
+  <div class="overlay" id="overlay">
+    <div class="msg">
+      <h2 id="overlayText">ГРА ЗАКІНЧЕНА</h2>
+      <div style="color:#fff">Натисніть R для рестарту</div>
+    </div>
+  </div>
+
+<script>
+'use strict';
+
+// ============================================================
+//  MAT4 — minimal matrix math (column-major)
+// ============================================================
+const M4 = {
+  create() { return new Float32Array(16); },
+  identity(o) {
+    o[0]=1;o[1]=0;o[2]=0;o[3]=0;
+    o[4]=0;o[5]=1;o[6]=0;o[7]=0;
+    o[8]=0;o[9]=0;o[10]=1;o[11]=0;
+    o[12]=0;o[13]=0;o[14]=0;o[15]=1;
+    return o;
+  },
+  perspective(o, fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2);
+    const nf = 1 / (near - far);
+    o[0]=f/aspect; o[1]=0; o[2]=0; o[3]=0;
+    o[4]=0; o[5]=f; o[6]=0; o[7]=0;
+    o[8]=0; o[9]=0; o[10]=(far+near)*nf; o[11]=-1;
+    o[12]=0; o[13]=0; o[14]=2*far*near*nf; o[15]=0;
+    return o;
+  },
+  lookAt(o, eye, center, up) {
+    const [ex,ey,ez]=eye, [cx,cy,cz]=center, [ux,uy,uz]=up;
+    let zx=ex-cx, zy=ey-cy, zz=ez-cz;
+    let l=1/Math.hypot(zx,zy,zz); zx*=l; zy*=l; zz*=l;
+    let xx=uy*zz-uz*zy, xy=uz*zx-ux*zz, xz=ux*zy-uy*zx;
+    l=1/Math.hypot(xx,xy,xz); xx*=l; xy*=l; xz*=l;
+    const yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+    o[0]=xx; o[1]=yx; o[2]=zx; o[3]=0;
+    o[4]=xy; o[5]=yy; o[6]=zy; o[7]=0;
+    o[8]=xz; o[9]=yz; o[10]=zz; o[11]=0;
+    o[12]=-(xx*ex+xy*ey+xz*ez);
+    o[13]=-(yx*ex+yy*ey+yz*ez);
+    o[14]=-(zx*ex+zy*ey+zz*ez);
+    o[15]=1;
+    return o;
+  },
+  translate(o, m, x, y, z) {
+    if (o !== m) for (let i = 0; i < 12; i++) o[i] = m[i];
+    o[12] = m[0]*x + m[4]*y + m[8]*z + m[12];
+    o[13] = m[1]*x + m[5]*y + m[9]*z + m[13];
+    o[14] = m[2]*x + m[6]*y + m[10]*z + m[14];
+    o[15] = m[3]*x + m[7]*y + m[11]*z + m[15];
+    return o;
+  },
+  scale(o, m, x, y, z) {
+    o[0]=m[0]*x; o[1]=m[1]*x; o[2]=m[2]*x; o[3]=m[3]*x;
+    o[4]=m[4]*y; o[5]=m[5]*y; o[6]=m[6]*y; o[7]=m[7]*y;
+    o[8]=m[8]*z; o[9]=m[9]*z; o[10]=m[10]*z; o[11]=m[11]*z;
+    o[12]=m[12]; o[13]=m[13]; o[14]=m[14]; o[15]=m[15];
+    return o;
+  },
+  ortho(o, l, r, b, t, n, f) {
+    const lr = 1/(l-r), bt = 1/(b-t), nf = 1/(n-f);
+    o[0]=-2*lr; o[1]=0; o[2]=0; o[3]=0;
+    o[4]=0; o[5]=-2*bt; o[6]=0; o[7]=0;
+    o[8]=0; o[9]=0; o[10]=2*nf; o[11]=0;
+    o[12]=(l+r)*lr; o[13]=(t+b)*bt; o[14]=(f+n)*nf; o[15]=1;
+    return o;
+  },
+  rotateY(o, m, a) {
+    const s = Math.sin(a), c = Math.cos(a);
+    const m00=m[0],m01=m[1],m02=m[2],m03=m[3];
+    const m20=m[8],m21=m[9],m22=m[10],m23=m[11];
+    o[0]=m00*c - m20*s; o[1]=m01*c - m21*s; o[2]=m02*c - m22*s; o[3]=m03*c - m23*s;
+    o[8]=m00*s + m20*c; o[9]=m01*s + m21*c; o[10]=m02*s + m22*c; o[11]=m03*s + m23*c;
+    o[4]=m[4]; o[5]=m[5]; o[6]=m[6]; o[7]=m[7];
+    o[12]=m[12]; o[13]=m[13]; o[14]=m[14]; o[15]=m[15];
+    return o;
+  },
+  multiply(o, a, b) {
+    const a00=a[0],a01=a[1],a02=a[2],a03=a[3];
+    const a10=a[4],a11=a[5],a12=a[6],a13=a[7];
+    const a20=a[8],a21=a[9],a22=a[10],a23=a[11];
+    const a30=a[12],a31=a[13],a32=a[14],a33=a[15];
+    for (let i = 0; i < 4; i++) {
+      const b0=b[i*4], b1=b[i*4+1], b2=b[i*4+2], b3=b[i*4+3];
+      o[i*4]   = b0*a00 + b1*a10 + b2*a20 + b3*a30;
+      o[i*4+1] = b0*a01 + b1*a11 + b2*a21 + b3*a31;
+      o[i*4+2] = b0*a02 + b1*a12 + b2*a22 + b3*a32;
+      o[i*4+3] = b0*a03 + b1*a13 + b2*a23 + b3*a33;
+    }
+    return o;
+  },
+  inverse(o, m) {
+    const a00=m[0],a01=m[1],a02=m[2],a03=m[3];
+    const a10=m[4],a11=m[5],a12=m[6],a13=m[7];
+    const a20=m[8],a21=m[9],a22=m[10],a23=m[11];
+    const a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+    const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10;
+    const b03=a01*a12-a02*a11, b04=a01*a13-a03*a11, b05=a02*a13-a03*a12;
+    const b06=a20*a31-a21*a30, b07=a20*a32-a22*a30, b08=a20*a33-a23*a30;
+    const b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+    let det = b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+    if (!det) return null;
+    det = 1.0 / det;
+    o[0]=(a11*b11-a12*b10+a13*b09)*det;
+    o[1]=(a02*b10-a01*b11-a03*b09)*det;
+    o[2]=(a31*b05-a32*b04+a33*b03)*det;
+    o[3]=(a22*b04-a21*b05-a23*b03)*det;
+    o[4]=(a12*b08-a10*b11-a13*b07)*det;
+    o[5]=(a00*b11-a02*b08+a03*b07)*det;
+    o[6]=(a32*b02-a30*b05-a33*b01)*det;
+    o[7]=(a20*b05-a22*b02+a23*b01)*det;
+    o[8]=(a10*b10-a11*b08+a13*b06)*det;
+    o[9]=(a01*b08-a00*b10-a03*b06)*det;
+    o[10]=(a30*b04-a31*b02+a33*b00)*det;
+    o[11]=(a21*b02-a20*b04-a23*b00)*det;
+    o[12]=(a11*b07-a10*b09-a12*b06)*det;
+    o[13]=(a00*b09-a01*b07+a02*b06)*det;
+    o[14]=(a31*b01-a30*b03-a32*b00)*det;
+    o[15]=(a20*b03-a21*b01+a22*b00)*det;
+    return o;
+  },
+  invertTranspose3(o, m) {
+    // 3x3 inverse-transpose stored as mat3 (9 floats) for normal matrix
+    const a00=m[0],a01=m[1],a02=m[2];
+    const a10=m[4],a11=m[5],a12=m[6];
+    const a20=m[8],a21=m[9],a22=m[10];
+    const b01 =  a22*a11 - a12*a21;
+    const b11 = -a22*a10 + a12*a20;
+    const b21 =  a21*a10 - a11*a20;
+    let det = a00*b01 + a01*b11 + a02*b21;
+    if (!det) { o[0]=1;o[1]=0;o[2]=0;o[3]=0;o[4]=1;o[5]=0;o[6]=0;o[7]=0;o[8]=1; return o; }
+    det = 1/det;
+    // inverse
+    const i00 = b01*det;
+    const i01 = (-a22*a01 + a02*a21)*det;
+    const i02 = (a12*a01 - a02*a11)*det;
+    const i10 = b11*det;
+    const i11 = (a22*a00 - a02*a20)*det;
+    const i12 = (-a12*a00 + a02*a10)*det;
+    const i20 = b21*det;
+    const i21 = (-a21*a00 + a01*a20)*det;
+    const i22 = (a11*a00 - a01*a10)*det;
+    // transpose
+    o[0]=i00; o[1]=i10; o[2]=i20;
+    o[3]=i01; o[4]=i11; o[5]=i21;
+    o[6]=i02; o[7]=i12; o[8]=i22;
+    return o;
+  }
+};
+
+// ============================================================
+//  WebGL setup
+// ============================================================
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl', { antialias: true, alpha: true });
+if (!gl) { document.body.innerHTML = '<h1 style="color:white">WebGL not supported</h1>'; throw new Error('no webgl'); }
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+resize();
+window.addEventListener('resize', () => { resize(); if (typeof resizeHdrFBOs === 'function') resizeHdrFBOs(); });
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+gl.cullFace(gl.BACK);
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+// ============================================================
+//  Shaders
+// ============================================================
+const VS_LIT = `
+attribute vec3 aPos;
+attribute vec3 aNormal;
+attribute vec2 aUV;
+uniform mat4 uModel;
+uniform mat4 uVP;
+uniform mat4 uShadowVP;
+uniform mat3 uNormalMat;
+uniform vec2 uUVScale;
+varying vec3 vNormal;
+varying vec3 vWorldPos;
+varying vec4 vShadowCoord;
+varying vec2 vUV;
+void main() {
+  vec4 wp = uModel * vec4(aPos, 1.0);
+  vWorldPos = wp.xyz;
+  vNormal = normalize(uNormalMat * aNormal);
+  vShadowCoord = uShadowVP * wp;
+  vUV = aUV * uUVScale;
+  gl_Position = uVP * wp;
+}
+`;
+
+const VS_SHADOW = `
+attribute vec3 aPos;
+uniform mat4 uModel;
+uniform mat4 uShadowVP;
+void main() { gl_Position = uShadowVP * uModel * vec4(aPos, 1.0); }
+`;
+const FS_SHADOW = `
+precision highp float;
+vec4 packDepth(float d) {
+  vec4 bias = vec4(1.0/255.0, 1.0/255.0, 1.0/255.0, 0.0);
+  vec4 c = fract(d * vec4(1.0, 255.0, 65025.0, 16581375.0));
+  c -= c.yzww * bias;
+  return c;
+}
+void main() {
+  gl_FragColor = packDepth(gl_FragCoord.z);
+}
+`;
+
+const FS_LIT = `
+precision highp float;
+varying vec3 vNormal;
+varying vec3 vWorldPos;
+varying vec4 vShadowCoord;
+uniform vec3 uColor;
+uniform vec3 uEmissive;
+uniform vec3 uLightDir;
+uniform vec3 uLightColor;
+uniform vec3 uFillDir;
+uniform vec3 uFillColor;
+uniform vec3 uAmbient;
+uniform vec3 uAmbientGround;
+uniform vec3 uCamPos;
+uniform float uOpacity;
+uniform vec3 uPointPos[4];
+uniform vec3 uPointColor[4];
+uniform float uPointRange[4];
+uniform vec3 uFogColor;
+uniform vec2 uFog;
+uniform sampler2D uShadowMap;
+uniform vec2 uShadowTexel;
+uniform sampler2D uTexture;
+uniform float uUseTexture;
+varying vec2 vUV;
+
+float unpackDepth(vec4 c) {
+  return dot(c, vec4(1.0, 1.0/255.0, 1.0/65025.0, 1.0/16581375.0));
+}
+float sampleShadow(vec2 uv, float compareZ) {
+  return unpackDepth(texture2D(uShadowMap, uv)) < compareZ ? 0.0 : 1.0;
+}
+float pcfShadow(vec3 sc, float bias) {
+  float z = sc.z - bias;
+  float s = 0.0;
+  for (int x = -1; x <= 1; x++) {
+    for (int y = -1; y <= 1; y++) {
+      vec2 off = vec2(float(x), float(y)) * uShadowTexel;
+      s += sampleShadow(sc.xy + off, z);
+    }
+  }
+  return s / 9.0;
+}
+
+void main() {
+  vec3 N = normalize(vNormal);
+  vec3 V = normalize(uCamPos - vWorldPos);
+
+  // Hemisphere ambient (sky/ground)
+  float upDot = N.y * 0.5 + 0.5;
+  vec3 ambient = mix(uAmbientGround, uAmbient, upDot);
+
+  // Key directional light (Blinn-Phong)
+  vec3 L = normalize(uLightDir);
+  float diff = max(dot(N, L), 0.0);
+  vec3 H = normalize(L + V);
+  float spec = pow(max(dot(N, H), 0.0), 48.0);
+
+  // Fill directional (cooler, opposite side)
+  vec3 FL = normalize(uFillDir);
+  float fdiff = max(dot(N, FL), 0.0);
+  vec3 FH = normalize(FL + V);
+  float fspec = pow(max(dot(N, FH), 0.0), 32.0);
+
+  // Rim light — view-edge glow
+  float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+
+  // Shadow factor — only directional key light is shadowed
+  float shadow = 1.0;
+  vec3 sc = vShadowCoord.xyz / vShadowCoord.w;
+  sc = sc * 0.5 + 0.5;
+  if (sc.x > 0.0 && sc.x < 1.0 && sc.y > 0.0 && sc.y < 1.0 && sc.z < 1.0) {
+    float bias = max(0.005 * (1.0 - dot(N, L)), 0.0015);
+    shadow = pcfShadow(sc, bias);
+  }
+
+  vec3 lighting = ambient
+                + uLightColor * diff * shadow
+                + uFillColor * fdiff * 0.6;
+
+  vec3 specular = uLightColor * spec * 0.8 * shadow
+                + uFillColor * fspec * 0.4;
+
+  vec3 rimGlow = (uLightColor * 0.3 + uFillColor * 0.5) * rim;
+
+  // 4 colored point lights
+  vec3 pointDiff = vec3(0.0);
+  vec3 pointSpec = vec3(0.0);
+  for (int i = 0; i < 4; i++) {
+    vec3 PL = uPointPos[i] - vWorldPos;
+    float pdist = length(PL);
+    vec3 PLn = PL / max(pdist, 0.0001);
+    float r = uPointRange[i];
+    float att = clamp(1.0 - pdist / r, 0.0, 1.0);
+    att = att * att;
+    float pd = max(dot(N, PLn), 0.0);
+    vec3 PH = normalize(PLn + V);
+    float ps = pow(max(dot(N, PH), 0.0), 24.0);
+    pointDiff += uPointColor[i] * pd * att;
+    pointSpec += uPointColor[i] * ps * att;
+  }
+
+  vec3 albedo = uColor;
+  if (uUseTexture > 0.5) {
+    vec3 tex = texture2D(uTexture, vUV).rgb;
+    // Treat 0.5 as neutral so texture brightens/darkens around uColor
+    albedo *= tex * 2.0;
+  }
+
+  vec3 color = albedo * (lighting + pointDiff)
+             + specular + pointSpec
+             + rimGlow
+             + uEmissive;
+
+  // Fog
+  float d = distance(uCamPos, vWorldPos);
+  float fogF = clamp((d - uFog.x) / (uFog.y - uFog.x), 0.0, 1.0);
+  color = mix(color, uFogColor, fogF * 0.7);
+
+  // Output linear HDR — tone mapping happens in composite pass
+  gl_FragColor = vec4(color, uOpacity);
+}
+`;
+
+const VS_UNLIT = `
+attribute vec3 aPos;
+uniform mat4 uModel;
+uniform mat4 uVP;
+void main() { gl_Position = uVP * uModel * vec4(aPos, 1.0); }
+`;
+const FS_UNLIT = `
+precision highp float;
+uniform vec3 uColor;
+uniform float uOpacity;
+void main() { gl_FragColor = vec4(uColor, uOpacity); }
+`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function getLocs(p, attrs, uniforms) {
+  const a = {}, u = {};
+  for (const n of attrs) a[n] = gl.getAttribLocation(p, n);
+  for (const n of uniforms) u[n] = gl.getUniformLocation(p, n);
+  return { p, a, u };
+}
+
+const litP = getLocs(program(VS_LIT, FS_LIT),
+  ['aPos', 'aNormal', 'aUV'],
+  ['uModel','uVP','uShadowVP','uNormalMat','uColor','uEmissive',
+   'uLightDir','uLightColor','uFillDir','uFillColor',
+   'uAmbient','uAmbientGround','uCamPos','uOpacity',
+   'uPointPos[0]','uPointPos[1]','uPointPos[2]','uPointPos[3]',
+   'uPointColor[0]','uPointColor[1]','uPointColor[2]','uPointColor[3]',
+   'uPointRange[0]','uPointRange[1]','uPointRange[2]','uPointRange[3]',
+   'uFogColor','uFog','uShadowMap','uShadowTexel',
+   'uTexture','uUseTexture','uUVScale']);
+
+const unlitP = getLocs(program(VS_UNLIT, FS_UNLIT),
+  ['aPos'], ['uModel','uVP','uColor','uOpacity']);
+
+const shadowP = getLocs(program(VS_SHADOW, FS_SHADOW),
+  ['aPos'], ['uModel','uShadowVP']);
+
+// ===== Post-process / sky shaders =====
+const VS_SKY = `
+attribute vec2 aPos;
+varying vec2 vNDC;
+void main() { vNDC = aPos; gl_Position = vec4(aPos, 1.0, 1.0); }
+`;
+const FS_SKY = `
+precision highp float;
+varying vec2 vNDC;
+uniform mat4 uInvVP;
+uniform vec3 uSunDir;
+vec3 skyColor(vec3 ray) {
+  return vec3(0.012, 0.012, 0.030);
+}
+void main() {
+  vec4 n = uInvVP * vec4(vNDC, -1.0, 1.0);
+  vec4 f = uInvVP * vec4(vNDC,  1.0, 1.0);
+  vec3 ray = normalize(f.xyz/f.w - n.xyz/n.w);
+  gl_FragColor = vec4(skyColor(ray), 1.0);
+}
+`;
+
+const VS_QUAD = `
+attribute vec2 aPos;
+varying vec2 vUV;
+void main() { vUV = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }
+`;
+
+const FS_THRESHOLD = `
+precision highp float;
+varying vec2 vUV;
+uniform sampler2D uTex;
+uniform float uThreshold;
+uniform float uKnee;
+void main() {
+  vec3 c = texture2D(uTex, vUV).rgb;
+  float b = max(max(c.r, c.g), c.b);
+  // Soft knee threshold (Karis / UE-style)
+  float soft = b - uThreshold + uKnee;
+  soft = clamp(soft, 0.0, 2.0 * uKnee);
+  soft = soft * soft / (4.0 * uKnee + 0.00001);
+  float contrib = max(b - uThreshold, soft) / max(b, 0.00001);
+  gl_FragColor = vec4(c * contrib, 1.0);
+}
+`;
+
+const FS_BLUR = `
+precision highp float;
+varying vec2 vUV;
+uniform sampler2D uTex;
+uniform vec2 uDir;
+void main() {
+  const float w0 = 0.227027;
+  const float w1 = 0.1945946;
+  const float w2 = 0.1216216;
+  const float w3 = 0.054054;
+  const float w4 = 0.016216;
+  vec3 c = texture2D(uTex, vUV).rgb * w0;
+  c += (texture2D(uTex, vUV + uDir * 1.0).rgb + texture2D(uTex, vUV - uDir * 1.0).rgb) * w1;
+  c += (texture2D(uTex, vUV + uDir * 2.0).rgb + texture2D(uTex, vUV - uDir * 2.0).rgb) * w2;
+  c += (texture2D(uTex, vUV + uDir * 3.0).rgb + texture2D(uTex, vUV - uDir * 3.0).rgb) * w3;
+  c += (texture2D(uTex, vUV + uDir * 4.0).rgb + texture2D(uTex, vUV - uDir * 4.0).rgb) * w4;
+  gl_FragColor = vec4(c, 1.0);
+}
+`;
+
+const FS_COMPOSITE = `
+precision highp float;
+varying vec2 vUV;
+uniform sampler2D uScene;
+uniform sampler2D uBloom;
+uniform float uBloomStrength;
+uniform float uExposure;
+// ACES filmic tone map (Narkowicz approximation)
+vec3 ACES(vec3 x) {
+  const float a = 2.51;
+  const float b = 0.03;
+  const float c = 2.43;
+  const float d = 0.59;
+  const float e = 0.14;
+  return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
+}
+void main() {
+  vec3 scene = texture2D(uScene, vUV).rgb;
+  vec3 bloom = texture2D(uBloom, vUV).rgb;
+  vec3 col = scene + bloom * uBloomStrength;
+  col *= uExposure;
+  col = ACES(col);
+  col = pow(col, vec3(1.0/2.2));
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+const skyP = getLocs(program(VS_SKY, FS_SKY), ['aPos'], ['uInvVP','uSunDir']);
+const thresholdP = getLocs(program(VS_QUAD, FS_THRESHOLD), ['aPos'], ['uTex','uThreshold','uKnee']);
+const blurP = getLocs(program(VS_QUAD, FS_BLUR), ['aPos'], ['uTex','uDir']);
+const compP = getLocs(program(VS_QUAD, FS_COMPOSITE), ['aPos'], ['uScene','uBloom','uBloomStrength','uExposure']);
+
+// ============================================================
+//  Shadow framebuffer (depth packed into RGBA color attachment)
+// ============================================================
+const SHADOW_SIZE = 1024;
+const shadowTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, SHADOW_SIZE, SHADOW_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+const shadowDepth = gl.createRenderbuffer();
+gl.bindRenderbuffer(gl.RENDERBUFFER, shadowDepth);
+gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, SHADOW_SIZE, SHADOW_SIZE);
+
+const shadowFB = gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFB);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, shadowTex, 0);
+gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, shadowDepth);
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+// ============================================================
+//  HDR / Bloom framebuffers
+// ============================================================
+const halfFloatExt = gl.getExtension('OES_texture_half_float');
+const halfFloatLinear = gl.getExtension('OES_texture_half_float_linear');
+const colorBufferExt = gl.getExtension('EXT_color_buffer_half_float');
+const HDR_TYPE = (halfFloatExt && colorBufferExt) ? halfFloatExt.HALF_FLOAT_OES : gl.UNSIGNED_BYTE;
+const HDR_FILTER = halfFloatLinear ? gl.LINEAR : gl.NEAREST;
+
+function makeFBO(w, h, hdr, withDepth) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  const type = hdr ? HDR_TYPE : gl.UNSIGNED_BYTE;
+  const filter = hdr ? HDR_FILTER : gl.LINEAR;
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  let depthRB = null;
+  if (withDepth) {
+    depthRB = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depthRB);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+  }
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (depthRB) gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRB);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fb, tex, depthRB, w, h };
+}
+
+function destroyFBO(o) {
+  if (!o) return;
+  gl.deleteTexture(o.tex);
+  gl.deleteFramebuffer(o.fb);
+  if (o.depthRB) gl.deleteRenderbuffer(o.depthRB);
+}
+
+let hdrFB = null, bloomA = null, bloomB = null;
+function resizeHdrFBOs() {
+  const w = canvas.width, h = canvas.height;
+  const bw = Math.max(1, w >> 1), bh = Math.max(1, h >> 1);
+  destroyFBO(hdrFB); destroyFBO(bloomA); destroyFBO(bloomB);
+  hdrFB = makeFBO(w, h, true, true);
+  bloomA = makeFBO(bw, bh, true, false);
+  bloomB = makeFBO(bw, bh, true, false);
+}
+resizeHdrFBOs();
+
+// Fullscreen quad
+const fsQuadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, fsQuadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+function drawQuad(prog) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, fsQuadBuf);
+  gl.enableVertexAttribArray(prog.a.aPos);
+  gl.vertexAttribPointer(prog.a.aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// ============================================================
+//  Geometry
+// ============================================================
+function makeCube() {
+  const f = [
+    [[ 0.5,-0.5,-0.5],[ 0.5, 0.5,-0.5],[ 0.5, 0.5, 0.5],[ 0.5,-0.5, 0.5],[1,0,0]],
+    [[-0.5,-0.5, 0.5],[-0.5, 0.5, 0.5],[-0.5, 0.5,-0.5],[-0.5,-0.5,-0.5],[-1,0,0]],
+    [[-0.5, 0.5,-0.5],[-0.5, 0.5, 0.5],[ 0.5, 0.5, 0.5],[ 0.5, 0.5,-0.5],[0,1,0]],
+    [[-0.5,-0.5, 0.5],[-0.5,-0.5,-0.5],[ 0.5,-0.5,-0.5],[ 0.5,-0.5, 0.5],[0,-1,0]],
+    [[-0.5,-0.5, 0.5],[ 0.5,-0.5, 0.5],[ 0.5, 0.5, 0.5],[-0.5, 0.5, 0.5],[0,0,1]],
+    [[ 0.5,-0.5,-0.5],[-0.5,-0.5,-0.5],[-0.5, 0.5,-0.5],[ 0.5, 0.5,-0.5],[0,0,-1]],
+  ];
+  const pos = [], nor = [], uv = [], idx = [];
+  for (let i = 0; i < f.length; i++) {
+    const [v0,v1,v2,v3,n] = f[i];
+    const base = i * 4;
+    pos.push(...v0, ...v1, ...v2, ...v3);
+    for (let k = 0; k < 4; k++) nor.push(...n);
+    // UV: (0,0)(0,1)(1,1)(1,0) — matches winding for square face
+    uv.push(0,0, 0,1, 1,1, 1,0);
+    idx.push(base, base+1, base+2, base, base+2, base+3);
+  }
+  return { pos: new Float32Array(pos), nor: new Float32Array(nor), uv: new Float32Array(uv), idx: new Uint16Array(idx) };
+}
+
+function makePlane(w, h) {
+  const hw = w/2, hh = h/2;
+  return {
+    pos: new Float32Array([-hw,0,-hh,  hw,0,-hh,  hw,0,hh,  -hw,0,hh]),
+    nor: new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]),
+    uv: new Float32Array([0,0, 1,0, 1,1, 0,1]),
+    idx: new Uint16Array([0,1,2, 0,2,3])
+  };
+}
+
+function uploadMesh(m) {
+  const posBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, m.pos, gl.STATIC_DRAW);
+  const norBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, norBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, m.nor, gl.STATIC_DRAW);
+  const uvBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, m.uv, gl.STATIC_DRAW);
+  const idxBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.idx, gl.STATIC_DRAW);
+  return { posBuf, norBuf, uvBuf, idxBuf, count: m.idx.length };
+}
+
+const cubeMesh = uploadMesh(makeCube());
+const floorMesh = uploadMesh(makePlane(30, 20));
+
+// ============================================================
+//  Procedural block texture (bevel + inset + noise)
+// ============================================================
+function makeBlockTextureCanvas() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  // base — middle grey so multiplication preserves color
+  ctx.fillStyle = '#9a9a9a';
+  ctx.fillRect(0, 0, 128, 128);
+  // diagonal bevel: bright top-left, darker bottom-right
+  const grad = ctx.createLinearGradient(0, 0, 128, 128);
+  grad.addColorStop(0, 'rgba(255,255,255,0.55)');
+  grad.addColorStop(0.5, 'rgba(255,255,255,0)');
+  grad.addColorStop(1, 'rgba(0,0,0,0.45)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 128, 128);
+  // outer rim dark frame
+  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  ctx.lineWidth = 6;
+  ctx.strokeRect(3, 3, 122, 122);
+  // inner bright inset
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(12, 12, 104, 104);
+  // tiny brushed-noise
+  const img = ctx.getImageData(0, 0, 128, 128);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const n = (Math.random() - 0.5) * 18;
+    img.data[i]   = Math.max(0, Math.min(255, img.data[i]   + n));
+    img.data[i+1] = Math.max(0, Math.min(255, img.data[i+1] + n));
+    img.data[i+2] = Math.max(0, Math.min(255, img.data[i+2] + n));
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+function makeSurfaceTextureCanvas() {
+  // Floor / wall — subtle grid pattern, very dark
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#808080';
+  ctx.fillRect(0, 0, 256, 256);
+  // grid lines
+  ctx.strokeStyle = 'rgba(150,150,170,0.5)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 256; i += 32) {
+    ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, 256); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(256, i); ctx.stroke();
+  }
+  // noise
+  const img = ctx.getImageData(0, 0, 256, 256);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const n = (Math.random() - 0.5) * 30;
+    img.data[i]   = Math.max(0, Math.min(255, img.data[i]   + n));
+    img.data[i+1] = Math.max(0, Math.min(255, img.data[i+1] + n));
+    img.data[i+2] = Math.max(0, Math.min(255, img.data[i+2] + n));
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+function makeTexture(src, repeat) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  const w = repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, w);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, w);
+  return t;
+}
+
+const blockTex = makeTexture(makeBlockTextureCanvas(), false);
+const surfaceTex = makeTexture(makeSurfaceTextureCanvas(), true);
+
+// Vertical wall (XY plane, normal +Z)
+function makeWall(w, h) {
+  const hw = w/2, hh = h/2;
+  return {
+    pos: new Float32Array([-hw,-hh,0,  hw,-hh,0,  hw,hh,0,  -hw,hh,0]),
+    nor: new Float32Array([0,0,1, 0,0,1, 0,0,1, 0,0,1]),
+    uv: new Float32Array([0,0, 1,0, 1,1, 0,1]),
+    idx: new Uint16Array([0,1,2, 0,2,3])
+  };
+}
+const wallMesh = uploadMesh(makeWall(18, 24));
+
+// line geometry for grid
+function makeGridLines() {
+  const pts = [];
+  for (let x = 0; x <= COLS; x++) {
+    pts.push(x - 0.5, -0.5, -0.5);
+    pts.push(x - 0.5, ROWS - 0.5, -0.5);
+  }
+  for (let y = 0; y <= ROWS; y++) {
+    pts.push(-0.5, y - 0.5, -0.5);
+    pts.push(COLS - 0.5, y - 0.5, -0.5);
+  }
+  const posBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pts), gl.STATIC_DRAW);
+  return { posBuf, count: pts.length / 3 };
+}
+
+// ============================================================
+//  Game logic
+// ============================================================
+const COLS = 10, ROWS = 20;
+
+const COLORS = {
+  I: [0.0, 0.94, 0.94], O: [0.94, 0.94, 0.0], T: [0.63, 0.0, 0.94],
+  S: [0.0, 0.94, 0.0], Z: [0.94, 0.0, 0.0], J: [0.19, 0.38, 0.94], L: [0.94, 0.63, 0.0]
+};
+const SHAPES = {
+  I: [[1,1,1,1]],
+  O: [[1,1],[1,1]],
+  T: [[0,1,0],[1,1,1]],
+  S: [[0,1,1],[1,1,0]],
+  Z: [[1,1,0],[0,1,1]],
+  J: [[1,0,0],[1,1,1]],
+  L: [[0,0,1],[1,1,1]]
+};
+
+const gridLines = makeGridLines();
+
+let board, current, next, score, lines, level, dropInterval, lastDrop, gameOver, paused;
+
+function reset() {
+  board = Array.from({length: ROWS}, () => Array(COLS).fill(null));
+  score = 0; lines = 0; level = 1;
+  dropInterval = 800;
+  lastDrop = performance.now();
+  gameOver = false; paused = false;
+  next = randomPiece();
+  spawn();
+  updateUI();
+  hideOverlay();
+}
+function randomPiece() {
+  const keys = Object.keys(SHAPES);
+  const t = keys[Math.floor(Math.random() * keys.length)];
+  return { type: t, shape: SHAPES[t].map(r => r.slice()), x: 0, y: 0 };
+}
+function spawn() {
+  current = next;
+  current.x = Math.floor((COLS - current.shape[0].length) / 2);
+  current.y = 0;
+  next = randomPiece();
+  drawNext();
+  if (collides(current, 0, 0)) { gameOver = true; showOverlay('ГРА ЗАКІНЧЕНА', false); }
+}
+function collides(p, dx, dy, shape) {
+  shape = shape || p.shape;
+  for (let y = 0; y < shape.length; y++)
+    for (let x = 0; x < shape[y].length; x++) {
+      if (!shape[y][x]) continue;
+      const nx = p.x + x + dx, ny = p.y + y + dy;
+      if (nx < 0 || nx >= COLS || ny >= ROWS) return true;
+      if (ny >= 0 && board[ny][nx]) return true;
+    }
+  return false;
+}
+function merge() {
+  for (let y = 0; y < current.shape.length; y++)
+    for (let x = 0; x < current.shape[y].length; x++)
+      if (current.shape[y][x]) {
+        const by = current.y + y;
+        if (by >= 0) board[by][current.x + x] = current.type;
+      }
+}
+function clearLines() {
+  let cleared = 0;
+  for (let y = ROWS - 1; y >= 0; y--) {
+    if (board[y].every(c => c)) {
+      board.splice(y, 1);
+      board.unshift(Array(COLS).fill(null));
+      cleared++; y++;
+    }
+  }
+  if (cleared > 0) {
+    score += [0,100,300,500,800][cleared] * level;
+    lines += cleared;
+    level = Math.floor(lines / 10) + 1;
+    dropInterval = Math.max(80, 800 - (level - 1) * 60);
+    spawnParticles(cleared);
+    shakeTime = 0.3;
+    updateUI();
+  }
+}
+function rotate(s) {
+  const r = s.length, c = s[0].length;
+  const o = Array.from({length: c}, () => Array(r).fill(0));
+  for (let y = 0; y < r; y++) for (let x = 0; x < c; x++) o[x][r - 1 - y] = s[y][x];
+  return o;
+}
+function tryMove(dx, dy) { if (!collides(current, dx, dy)) { current.x += dx; current.y += dy; return true; } return false; }
+function tryRotate() {
+  const r = rotate(current.shape);
+  if (!collides(current, 0, 0, r)) { current.shape = r; return; }
+  for (const dx of [-1, 1, -2, 2])
+    if (!collides(current, dx, 0, r)) { current.x += dx; current.shape = r; return; }
+}
+function hardDrop() { while (tryMove(0, 1)) score += 2; lock(); }
+function lock() { merge(); clearLines(); spawn(); updateUI(); }
+
+// ============================================================
+//  Particles
+// ============================================================
+const particles = [];
+function spawnParticles(cleared) {
+  const count = cleared * 40;
+  for (let i = 0; i < count; i++) {
+    const keys = Object.keys(COLORS);
+    const c = COLORS[keys[Math.floor(Math.random() * keys.length)]];
+    particles.push({
+      x: Math.random() * COLS - COLS / 2,
+      y: Math.random() * 4 - 2,
+      z: Math.random() * 2 - 1,
+      vx: (Math.random() - 0.5) * 0.3,
+      vy: Math.random() * 0.4 + 0.1,
+      vz: (Math.random() - 0.5) * 0.3,
+      life: 1.5, max: 1.5, color: c
+    });
+  }
+}
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.z += p.vz;
+    p.vy -= 0.015;
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+// ============================================================
+//  Camera
+// ============================================================
+let camAzimuth = 0, camPolar = Math.PI / 2 - 0.1, camDistance = 28;
+let camTarget = [0, 0, 0];
+let dragging = false, lastMouse = { x: 0, y: 0 };
+let shakeTime = 0;
+
+canvas.addEventListener('mousedown', e => { dragging = true; lastMouse = { x: e.clientX, y: e.clientY }; });
+window.addEventListener('mouseup', () => dragging = false);
+window.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  camAzimuth -= (e.clientX - lastMouse.x) * 0.008;
+  camPolar -= (e.clientY - lastMouse.y) * 0.008;
+  camPolar = Math.max(0.2, Math.min(Math.PI - 0.2, camPolar));
+  lastMouse = { x: e.clientX, y: e.clientY };
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  camDistance *= 1 + e.deltaY * 0.0015;
+  camDistance = Math.max(12, Math.min(60, camDistance));
+}, { passive: false });
+
+function getCamPos() {
+  return [
+    camTarget[0] + camDistance * Math.sin(camPolar) * Math.sin(camAzimuth),
+    camTarget[1] + camDistance * Math.cos(camPolar),
+    camTarget[2] + camDistance * Math.sin(camPolar) * Math.cos(camAzimuth)
+  ];
+}
+
+// ============================================================
+//  Rendering helpers
+// ============================================================
+const tmpModel = M4.create(), tmpModelT = M4.create(), tmpModelS = M4.create();
+const normalMat = new Float32Array(9);
+
+function bindLitMesh(mesh) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, mesh.posBuf);
+  gl.enableVertexAttribArray(litP.a.aPos);
+  gl.vertexAttribPointer(litP.a.aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, mesh.norBuf);
+  gl.enableVertexAttribArray(litP.a.aNormal);
+  gl.vertexAttribPointer(litP.a.aNormal, 3, gl.FLOAT, false, 0, 0);
+  if (mesh.uvBuf && litP.a.aUV >= 0) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.uvBuf);
+    gl.enableVertexAttribArray(litP.a.aUV);
+    gl.vertexAttribPointer(litP.a.aUV, 2, gl.FLOAT, false, 0, 0);
+  }
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.idxBuf);
+}
+
+function drawLitCube(x, y, z, sx, sy, sz, color, emissive, opacity, vp, camPos) {
+  M4.identity(tmpModel);
+  M4.translate(tmpModel, tmpModel, x, y, z);
+  M4.scale(tmpModel, tmpModel, sx, sy, sz);
+  M4.invertTranspose3(normalMat, tmpModel);
+  gl.uniformMatrix4fv(litP.u.uModel, false, tmpModel);
+  gl.uniformMatrix3fv(litP.u.uNormalMat, false, normalMat);
+  gl.uniform3fv(litP.u.uColor, color);
+  gl.uniform3fv(litP.u.uEmissive, emissive);
+  gl.uniform1f(litP.u.uOpacity, opacity);
+  gl.drawElements(gl.TRIANGLES, cubeMesh.count, gl.UNSIGNED_SHORT, 0);
+}
+
+// ============================================================
+//  Main render
+// ============================================================
+const projMat = M4.create();
+const viewMat = M4.create();
+const vpMat = M4.create();
+const invVPMat = M4.create();
+
+let pulseA = 0.5, pulseB = 0.5, pulseC = 0.5;
+
+function setLitGlobals(camPos) {
+  gl.uniformMatrix4fv(litP.u.uVP, false, vpMat);
+  // Sunset key — dominant external sun, low and warm
+  gl.uniform3fv(litP.u.uLightDir, [0.75, 0.25, 0.4]);
+  gl.uniform3fv(litP.u.uLightColor, [2.2, 1.05, 0.45]);
+  // Twilight sky fill — cool diffuse from opposite horizon
+  gl.uniform3fv(litP.u.uFillDir, [-0.5, 0.6, -0.6]);
+  gl.uniform3fv(litP.u.uFillColor, [0.30, 0.40, 0.75]);
+  // Dusk hemisphere ambient — low, leaves room for sun to shape
+  gl.uniform3fv(litP.u.uAmbient, [0.12, 0.13, 0.22]);
+  gl.uniform3fv(litP.u.uAmbientGround, [0.08, 0.04, 0.07]);
+  gl.uniform3fv(litP.u.uCamPos, camPos);
+
+  // Subtle atmospheric accents — minor compared to sun
+  // 0: warm horizon glow (toward sun side)
+  gl.uniform3fv(litP.u['uPointPos[0]'], [18, 2, 8]);
+  gl.uniform3fv(litP.u['uPointColor[0]'], [0.6 * pulseA, 0.28 * pulseA, 0.10 * pulseA]);
+  gl.uniform1f(litP.u['uPointRange[0]'], 30.0);
+  // 1: cool dusk haze on opposite side
+  gl.uniform3fv(litP.u['uPointPos[1]'], [-14, 4, 4]);
+  gl.uniform3fv(litP.u['uPointColor[1]'], [0.10 * pulseB, 0.20 * pulseB, 0.45 * pulseB]);
+  gl.uniform1f(litP.u['uPointRange[1]'], 28.0);
+  // 2: very dim — disabled
+  gl.uniform3fv(litP.u['uPointPos[2]'], [0, 0, 0]);
+  gl.uniform3fv(litP.u['uPointColor[2]'], [0, 0, 0]);
+  gl.uniform1f(litP.u['uPointRange[2]'], 1.0);
+  // 3: disabled
+  gl.uniform3fv(litP.u['uPointPos[3]'], [0, 0, 0]);
+  gl.uniform3fv(litP.u['uPointColor[3]'], [0, 0, 0]);
+  gl.uniform1f(litP.u['uPointRange[3]'], 1.0);
+
+  gl.uniform3fv(litP.u.uFogColor, [0.18, 0.08, 0.18]);
+  gl.uniform2fv(litP.u.uFog, [28, 70]);
+}
+
+// Iterate every cube that should cast & receive shadows
+function forEachCubeOccluder(cb) {
+  const t = 0.3, fc = [0.95, 0.78, 0.0], fe = [0.25, 0.15, 0.0];
+  cb(0, -ROWS/2 - t/2, 0, COLS + t, t, t, fc, fe);
+  cb(0,  ROWS/2 + t/2, 0, COLS + t, t, t, fc, fe);
+  cb(-COLS/2 - t/2, 0, 0, t, ROWS + t, t, fc, fe);
+  cb( COLS/2 + t/2, 0, 0, t, ROWS + t, t, fc, fe);
+  const ox = -(COLS - 1) / 2, oy = (ROWS - 1) / 2;
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      const c = board[y][x];
+      if (c) {
+        const col = COLORS[c];
+        cb(ox + x, oy - y, 0, 0.92, 0.92, 0.92, col, [col[0]*0.2, col[1]*0.2, col[2]*0.2]);
+      }
+    }
+  }
+  if (current && !gameOver) {
+    for (let y = 0; y < current.shape.length; y++) {
+      for (let x = 0; x < current.shape[y].length; x++) {
+        if (current.shape[y][x]) {
+          const col = COLORS[current.type];
+          cb(ox + current.x + x, oy - (current.y + y), 0, 0.92, 0.92, 0.92, col, [col[0]*0.35, col[1]*0.35, col[2]*0.35]);
+        }
+      }
+    }
+  }
+}
+
+const shadowVPMat = M4.create();
+const lightViewMat = M4.create();
+const lightProjMat = M4.create();
+const LIGHT_DIR = [0.75, 0.25, 0.4]; // must match uLightDir (sunset, low angle)
+
+function bindShadowMesh(mesh) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, mesh.posBuf);
+  gl.enableVertexAttribArray(shadowP.a.aPos);
+  gl.vertexAttribPointer(shadowP.a.aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.idxBuf);
+}
+
+function setShadowModel(x, y, z, sx, sy, sz) {
+  M4.identity(tmpModel);
+  M4.translate(tmpModel, tmpModel, x, y, z);
+  M4.scale(tmpModel, tmpModel, sx, sy, sz);
+  gl.uniformMatrix4fv(shadowP.u.uModel, false, tmpModel);
+}
+
+function computeShadowVP() {
+  // Normalize light dir
+  const lx = LIGHT_DIR[0], ly = LIGHT_DIR[1], lz = LIGHT_DIR[2];
+  const len = Math.hypot(lx, ly, lz);
+  const dist = 30;
+  const lightPos = [lx/len * dist, ly/len * dist, lz/len * dist];
+  M4.lookAt(lightViewMat, lightPos, [0, 0, 0], [0, 1, 0]);
+  M4.ortho(lightProjMat, -20, 20, -20, 20, 1, 80);
+  M4.multiply(shadowVPMat, lightProjMat, lightViewMat);
+}
+
+function renderShadowPass() {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFB);
+  gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE);
+  gl.clearColor(1, 1, 1, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(shadowP.p);
+  gl.uniformMatrix4fv(shadowP.u.uShadowVP, false, shadowVPMat);
+
+  // Floor
+  bindShadowMesh(floorMesh);
+  M4.identity(tmpModel);
+  M4.translate(tmpModel, tmpModel, 0, -ROWS / 2 - 1.5, 0);
+  gl.uniformMatrix4fv(shadowP.u.uModel, false, tmpModel);
+  gl.drawElements(gl.TRIANGLES, floorMesh.count, gl.UNSIGNED_SHORT, 0);
+
+  // Back wall — strong shadow catcher
+  bindShadowMesh(wallMesh);
+  M4.identity(tmpModel);
+  M4.translate(tmpModel, tmpModel, 0, 0, -2);
+  gl.uniformMatrix4fv(shadowP.u.uModel, false, tmpModel);
+  gl.drawElements(gl.TRIANGLES, wallMesh.count, gl.UNSIGNED_SHORT, 0);
+
+  bindShadowMesh(cubeMesh);
+  forEachCubeOccluder((x, y, z, sx, sy, sz) => {
+    setShadowModel(x, y, z, sx, sy, sz);
+    gl.drawElements(gl.TRIANGLES, cubeMesh.count, gl.UNSIGNED_SHORT, 0);
+  });
+}
+
+function render(time) {
+  // --- update camera/proj ---
+  const aspect = canvas.width / canvas.height;
+  M4.perspective(projMat, 55 * Math.PI / 180, aspect, 0.1, 200);
+
+  let camPos = getCamPos();
+  if (shakeTime > 0) {
+    camPos = [camPos[0] + (Math.random()-0.5)*0.4, camPos[1] + (Math.random()-0.5)*0.4, camPos[2]];
+  }
+  M4.lookAt(viewMat, camPos, camTarget, [0, 1, 0]);
+  M4.multiply(vpMat, projMat, viewMat);
+
+  pulseA = 0.7 + Math.sin(time * 0.0021) * 0.3;
+  pulseB = 0.7 + Math.sin(time * 0.0017 + 1.5) * 0.3;
+  pulseC = 0.7 + Math.sin(time * 0.0024 + 3.0) * 0.3;
+
+  // --- Shadow pass ---
+  computeShadowVP();
+  renderShadowPass();
+
+  // --- Main HDR pass ---
+  gl.bindFramebuffer(gl.FRAMEBUFFER, hdrFB.fb);
+  gl.viewport(0, 0, hdrFB.w, hdrFB.h);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  // Sky background — full-screen quad at far plane, depth test off
+  gl.disable(gl.DEPTH_TEST);
+  gl.depthMask(false);
+  gl.disable(gl.CULL_FACE);
+  gl.useProgram(skyP.p);
+  M4.inverse(invVPMat, vpMat);
+  gl.uniformMatrix4fv(skyP.u.uInvVP, false, invVPMat);
+  const sl = Math.hypot(LIGHT_DIR[0], LIGHT_DIR[1], LIGHT_DIR[2]);
+  gl.uniform3fv(skyP.u.uSunDir, [LIGHT_DIR[0]/sl, LIGHT_DIR[1]/sl, LIGHT_DIR[2]/sl]);
+  drawQuad(skyP);
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(true);
+  gl.enable(gl.CULL_FACE);
+
+  gl.useProgram(litP.p);
+  setLitGlobals(camPos);
+  gl.uniformMatrix4fv(litP.u.uShadowVP, false, shadowVPMat);
+  gl.uniform2fv(litP.u.uShadowTexel, [1 / SHADOW_SIZE, 1 / SHADOW_SIZE]);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+  gl.uniform1i(litP.u.uShadowMap, 0);
+  gl.uniform1i(litP.u.uTexture, 1);
+
+  // Floor — tiled surface texture
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, surfaceTex);
+  gl.uniform1f(litP.u.uUseTexture, 1.0);
+  gl.uniform2fv(litP.u.uUVScale, [6, 4]);
+  bindLitMesh(floorMesh);
+  M4.identity(tmpModel);
+  M4.translate(tmpModel, tmpModel, 0, -ROWS / 2 - 1.5, 0);
+  M4.invertTranspose3(normalMat, tmpModel);
+  gl.uniformMatrix4fv(litP.u.uModel, false, tmpModel);
+  gl.uniformMatrix3fv(litP.u.uNormalMat, false, normalMat);
+  gl.uniform3fv(litP.u.uColor, [0.015, 0.015, 0.035]);
+  gl.uniform3fv(litP.u.uEmissive, [0, 0, 0]);
+  gl.uniform1f(litP.u.uOpacity, 1.0);
+  gl.drawElements(gl.TRIANGLES, floorMesh.count, gl.UNSIGNED_SHORT, 0);
+
+  // Back wall
+  bindLitMesh(wallMesh);
+  M4.identity(tmpModel);
+  M4.translate(tmpModel, tmpModel, 0, 0, -2);
+  M4.invertTranspose3(normalMat, tmpModel);
+  gl.uniformMatrix4fv(litP.u.uModel, false, tmpModel);
+  gl.uniformMatrix3fv(litP.u.uNormalMat, false, normalMat);
+  gl.uniform3fv(litP.u.uColor, [0.015, 0.015, 0.035]);
+  gl.uniform3fv(litP.u.uEmissive, [0, 0, 0]);
+  gl.uniform1f(litP.u.uOpacity, 1.0);
+  gl.drawElements(gl.TRIANGLES, wallMesh.count, gl.UNSIGNED_SHORT, 0);
+
+  // Cubes (frame + board + current piece) — block texture
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, blockTex);
+  gl.uniform1f(litP.u.uUseTexture, 1.0);
+  gl.uniform2fv(litP.u.uUVScale, [1, 1]);
+  bindLitMesh(cubeMesh);
+  forEachCubeOccluder((x, y, z, sx, sy, sz, color, emissive) => {
+    drawLitCube(x, y, z, sx, sy, sz, color, emissive, 1.0);
+  });
+
+  // Ghost piece (non-occluder, no texture)
+  if (current && !gameOver) {
+    gl.uniform1f(litP.u.uUseTexture, 0.0);
+    let gy = 0;
+    while (!collides(current, 0, gy + 1)) gy++;
+    const ox = -(COLS - 1) / 2, oy = (ROWS - 1) / 2;
+    gl.depthMask(false);
+    for (let y = 0; y < current.shape.length; y++) {
+      for (let x = 0; x < current.shape[y].length; x++) {
+        if (current.shape[y][x]) {
+          const col = COLORS[current.type];
+          drawLitCube(ox + current.x + x, oy - (current.y + y + gy), 0, 0.9, 0.9, 0.9, col, [0,0,0], 0.18);
+        }
+      }
+    }
+    gl.depthMask(true);
+  }
+
+  // --- Unlit pass: grid lines ---
+  gl.useProgram(unlitP.p);
+  gl.uniformMatrix4fv(unlitP.u.uVP, false, vpMat);
+  M4.identity(tmpModel);
+  M4.translate(tmpModel, tmpModel, -(COLS - 1) / 2, -(ROWS - 1) / 2, 0);
+  gl.uniformMatrix4fv(unlitP.u.uModel, false, tmpModel);
+  gl.uniform3fv(unlitP.u.uColor, [0.18, 0.18, 0.30]);
+  gl.uniform1f(unlitP.u.uOpacity, 0.7);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gridLines.posBuf);
+  gl.enableVertexAttribArray(unlitP.a.aPos);
+  gl.vertexAttribPointer(unlitP.a.aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.LINES, 0, gridLines.count);
+
+  // Particles
+  gl.useProgram(litP.p);
+  setLitGlobals(camPos);
+  gl.uniformMatrix4fv(litP.u.uShadowVP, false, shadowVPMat);
+  gl.uniform2fv(litP.u.uShadowTexel, [1 / SHADOW_SIZE, 1 / SHADOW_SIZE]);
+  gl.uniform1i(litP.u.uShadowMap, 0);
+  gl.uniform1f(litP.u.uUseTexture, 0.0);
+  bindLitMesh(cubeMesh);
+  gl.depthMask(false);
+  for (const p of particles) {
+    const a = Math.max(0, p.life / p.max);
+    drawLitCube(p.x, p.y, p.z, 0.2, 0.2, 0.2, p.color, [p.color[0]*0.8, p.color[1]*0.8, p.color[2]*0.8], a);
+  }
+  gl.depthMask(true);
+
+  // === Post-process: Bloom + composite ===
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  gl.disable(gl.BLEND);
+
+  // Threshold: hdrFB → bloomA (half res)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomA.fb);
+  gl.viewport(0, 0, bloomA.w, bloomA.h);
+  gl.useProgram(thresholdP.p);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, hdrFB.tex);
+  gl.uniform1i(thresholdP.u.uTex, 0);
+  gl.uniform1f(thresholdP.u.uThreshold, 1.0);
+  gl.uniform1f(thresholdP.u.uKnee, 0.5);
+  drawQuad(thresholdP);
+
+  // Blur H: bloomA → bloomB
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomB.fb);
+  gl.viewport(0, 0, bloomB.w, bloomB.h);
+  gl.useProgram(blurP.p);
+  gl.bindTexture(gl.TEXTURE_2D, bloomA.tex);
+  gl.uniform1i(blurP.u.uTex, 0);
+  gl.uniform2fv(blurP.u.uDir, [1.5 / bloomA.w, 0]);
+  drawQuad(blurP);
+
+  // Blur V: bloomB → bloomA
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomA.fb);
+  gl.viewport(0, 0, bloomA.w, bloomA.h);
+  gl.bindTexture(gl.TEXTURE_2D, bloomB.tex);
+  gl.uniform2fv(blurP.u.uDir, [0, 1.5 / bloomB.h]);
+  drawQuad(blurP);
+
+  // Composite to screen with ACES tone map + gamma
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(compP.p);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, hdrFB.tex);
+  gl.uniform1i(compP.u.uScene, 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, bloomA.tex);
+  gl.uniform1i(compP.u.uBloom, 1);
+  gl.uniform1f(compP.u.uBloomStrength, 0.7);
+  gl.uniform1f(compP.u.uExposure, 0.9);
+  drawQuad(compP);
+
+  // Restore state
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.CULL_FACE);
+  gl.enable(gl.BLEND);
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+function drawCenteredBar(x, y, z, sx, sy, sz, color, emissive) {
+  drawLitCube(x, y, z, sx, sy, sz, color, emissive, 1.0);
+}
+
+// ============================================================
+//  Next-piece preview (2D isometric on canvas)
+// ============================================================
+const nextCanvas = document.getElementById('nextCanvas');
+const nctx = nextCanvas.getContext('2d');
+function drawNext() {
+  nctx.clearRect(0, 0, nextCanvas.width, nextCanvas.height);
+  const sh = next.shape, size = 22;
+  const offX = (nextCanvas.width - sh[0].length * size) / 2;
+  const offY = (nextCanvas.height - sh.length * size) / 2;
+  const c = COLORS[next.type];
+  const hex = `rgb(${Math.round(c[0]*255)},${Math.round(c[1]*255)},${Math.round(c[2]*255)})`;
+  for (let y = 0; y < sh.length; y++)
+    for (let x = 0; x < sh[y].length; x++)
+      if (sh[y][x]) draw3DCell(offX + x * size, offY + y * size, size, hex);
+}
+function draw3DCell(x, y, s, color) {
+  const dx = 4, dy = 4;
+  nctx.fillStyle = shade(color, 25);
+  nctx.beginPath();
+  nctx.moveTo(x, y); nctx.lineTo(x + dx, y - dy);
+  nctx.lineTo(x + s + dx, y - dy); nctx.lineTo(x + s, y);
+  nctx.closePath(); nctx.fill();
+  nctx.fillStyle = shade(color, -25);
+  nctx.beginPath();
+  nctx.moveTo(x + s, y); nctx.lineTo(x + s + dx, y - dy);
+  nctx.lineTo(x + s + dx, y + s - dy); nctx.lineTo(x + s, y + s);
+  nctx.closePath(); nctx.fill();
+  nctx.fillStyle = color;
+  nctx.fillRect(x, y, s, s);
+  nctx.strokeStyle = 'rgba(0,0,0,0.4)';
+  nctx.strokeRect(x, y, s, s);
+}
+function shade(rgb, amt) {
+  const m = rgb.match(/\d+/g).map(Number);
+  return `rgb(${Math.max(0,Math.min(255,m[0]+amt))},${Math.max(0,Math.min(255,m[1]+amt))},${Math.max(0,Math.min(255,m[2]+amt))})`;
+}
+
+// ============================================================
+//  UI / Input
+// ============================================================
+function updateUI() {
+  document.getElementById('score').textContent = score;
+  document.getElementById('lines').textContent = lines;
+  document.getElementById('level').textContent = level;
+}
+function showOverlay(text, pause) {
+  const o = document.getElementById('overlay');
+  document.getElementById('overlayText').textContent = text;
+  o.className = 'overlay show' + (pause ? ' pause' : '');
+}
+function hideOverlay() { document.getElementById('overlay').className = 'overlay'; }
+
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'r') { reset(); return; }
+  if (gameOver) return;
+  if (k === 'p') { paused = !paused; if (paused) showOverlay('ПАУЗА', true); else hideOverlay(); return; }
+  if (paused) return;
+  switch (e.key) {
+    case 'ArrowLeft': tryMove(-1, 0); break;
+    case 'ArrowRight': tryMove(1, 0); break;
+    case 'ArrowDown': if (tryMove(0, 1)) score++; updateUI(); break;
+    case 'ArrowUp': tryRotate(); break;
+    case ' ': e.preventDefault(); hardDrop(); break;
+  }
+});
+
+// ============================================================
+//  Loop
+// ============================================================
+let lastTime = performance.now();
+function loop(time) {
+  const dt = Math.min(0.05, (time - lastTime) / 1000);
+  lastTime = time;
+  if (!gameOver && !paused) {
+    if (time - lastDrop > dropInterval) { if (!tryMove(0, 1)) lock(); lastDrop = time; }
+  }
+  updateParticles(dt);
+  if (shakeTime > 0) shakeTime -= dt;
+  render(time);
+  requestAnimationFrame(loop);
+}
+
+reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
