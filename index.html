@@ -327,7 +327,10 @@ uniform vec2 uFog;
 uniform sampler2D uShadowMap;
 uniform vec2 uShadowTexel;
 uniform sampler2D uTexture;
+uniform sampler2D uSceneTexture;
+uniform vec2 uSceneTexel;
 uniform float uUseTexture;
+uniform float uGlass;
 varying vec2 vUV;
 
 float unpackDepth(vec4 c) {
@@ -407,10 +410,11 @@ void main() {
   }
 
   vec3 albedo = uColor;
+  vec3 tex = vec3(1.0);
   if (uUseTexture > 0.5) {
-    vec3 tex = texture2D(uTexture, vUV).rgb;
+    tex = texture2D(uTexture, vUV).rgb;
     // Treat 0.5 as neutral so texture brightens/darkens around uColor
-    albedo *= tex * 2.0;
+    albedo *= mix(tex * 2.0, tex * 1.35 + 0.32, uGlass);
   }
 
   vec3 color = albedo * (lighting + pointDiff)
@@ -418,13 +422,47 @@ void main() {
              + rimGlow
              + uEmissive;
 
+  if (uGlass > 0.5) {
+    float facing = max(dot(N, V), 0.0);
+    float fresnel = pow(1.0 - facing, 2.35);
+    float hardSpec = pow(max(dot(N, H), 0.0), 128.0);
+    float fillGlint = pow(max(dot(N, FH), 0.0), 72.0);
+    float texLuma = dot(tex, vec3(0.299, 0.587, 0.114));
+    vec2 screenUV = gl_FragCoord.xy * uSceneTexel;
+    vec2 lens = (vUV - 0.5) * (0.012 + fresnel * 0.020);
+    vec2 ripple = vec2(
+      sin((vUV.y + vWorldPos.y * 0.045) * 34.0),
+      cos((vUV.x + vWorldPos.x * 0.055) * 31.0)
+    ) * 0.0045;
+    vec2 normalBend = N.xy * 0.010;
+    vec2 refractUV = clamp(screenUV + lens + ripple + normalBend, uSceneTexel * 2.0, vec2(1.0) - uSceneTexel * 2.0);
+    vec3 refracted = texture2D(uSceneTexture, refractUV).rgb;
+    vec3 glassTint = mix(vec3(0.72, 0.92, 1.0), uColor, 0.46);
+    vec3 innerGlow = glassTint * (ambient * 1.8 + pointDiff * 0.35 + vec3(0.10 + texLuma * 0.08));
+    float edgeGlint = smoothstep(0.11, 0.0, min(min(vUV.x, 1.0 - vUV.x), min(vUV.y, 1.0 - vUV.y)));
+    vec3 glassSpec = uLightColor * hardSpec * 4.2 * shadow
+                   + uFillColor * fillGlint * 1.7
+                   + pointSpec * 1.9;
+    vec3 glassRim = mix(vec3(0.82, 0.96, 1.0), uColor, 0.22) * (fresnel * 2.3 + rim * 0.7);
+    vec3 colorCore = uColor * tex * 0.18;
+    vec3 glint = vec3(0.88, 0.97, 1.0) * edgeGlint * 0.42;
+    vec3 refractedTint = refracted * mix(vec3(0.82, 0.96, 1.10), glassTint, 0.24);
+    color = mix(refractedTint, innerGlow + colorCore, 0.34) + glassSpec + glassRim + glint;
+  }
+
   // Fog
   float d = distance(uCamPos, vWorldPos);
   float fogF = clamp((d - uFog.x) / (uFog.y - uFog.x), 0.0, 1.0);
   color = mix(color, uFogColor, fogF * 0.7);
 
   // Output linear HDR — tone mapping happens in composite pass
-  gl_FragColor = vec4(color, uOpacity);
+  float alpha = uOpacity;
+  if (uGlass > 0.5) {
+    float facingAlpha = pow(1.0 - max(dot(N, V), 0.0), 2.0);
+    float texAlpha = dot(tex, vec3(0.299, 0.587, 0.114));
+    alpha = clamp(uOpacity * (0.62 + facingAlpha * 0.55 + texAlpha * 0.18), 0.22, 0.86);
+  }
+  gl_FragColor = vec4(color, alpha);
 }
 `;
 
@@ -472,7 +510,7 @@ const litP = getLocs(program(VS_LIT, FS_LIT),
    'uPointColor[0]','uPointColor[1]','uPointColor[2]','uPointColor[3]',
    'uPointRange[0]','uPointRange[1]','uPointRange[2]','uPointRange[3]',
    'uFogColor','uFog','uShadowMap','uShadowTexel',
-   'uTexture','uUseTexture','uUVScale']);
+   'uTexture','uSceneTexture','uSceneTexel','uUseTexture','uGlass','uUVScale']);
 
 const unlitP = getLocs(program(VS_UNLIT, FS_UNLIT),
   ['aPos'], ['uModel','uVP','uColor','uOpacity']);
@@ -506,6 +544,15 @@ const VS_QUAD = `
 attribute vec2 aPos;
 varying vec2 vUV;
 void main() { vUV = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }
+`;
+
+const FS_COPY = `
+precision highp float;
+varying vec2 vUV;
+uniform sampler2D uTex;
+void main() {
+  gl_FragColor = texture2D(uTex, vUV);
+}
 `;
 
 const FS_THRESHOLD = `
@@ -574,6 +621,7 @@ void main() {
 `;
 
 const skyP = getLocs(program(VS_SKY, FS_SKY), ['aPos'], ['uInvVP','uSunDir']);
+const copyP = getLocs(program(VS_QUAD, FS_COPY), ['aPos'], ['uTex']);
 const thresholdP = getLocs(program(VS_QUAD, FS_THRESHOLD), ['aPos'], ['uTex','uThreshold','uKnee']);
 const blurP = getLocs(program(VS_QUAD, FS_BLUR), ['aPos'], ['uTex','uDir']);
 const compP = getLocs(program(VS_QUAD, FS_COMPOSITE), ['aPos'], ['uScene','uBloom','uBloomStrength','uExposure']);
@@ -640,12 +688,13 @@ function destroyFBO(o) {
   if (o.depthRB) gl.deleteRenderbuffer(o.depthRB);
 }
 
-let hdrFB = null, bloomA = null, bloomB = null;
+let hdrFB = null, refractFB = null, bloomA = null, bloomB = null;
 function resizeHdrFBOs() {
   const w = canvas.width, h = canvas.height;
   const bw = Math.max(1, w >> 1), bh = Math.max(1, h >> 1);
-  destroyFBO(hdrFB); destroyFBO(bloomA); destroyFBO(bloomB);
+  destroyFBO(hdrFB); destroyFBO(refractFB); destroyFBO(bloomA); destroyFBO(bloomB);
   hdrFB = makeFBO(w, h, true, true);
+  refractFB = makeFBO(w, h, true, false);
   bloomA = makeFBO(bw, bh, true, false);
   bloomB = makeFBO(bw, bh, true, false);
 }
@@ -661,6 +710,24 @@ function drawQuad(prog) {
   gl.enableVertexAttribArray(prog.a.aPos);
   gl.vertexAttribPointer(prog.a.aPos, 2, gl.FLOAT, false, 0, 0);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function copySceneForRefraction() {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, refractFB.fb);
+  gl.viewport(0, 0, refractFB.w, refractFB.h);
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  gl.disable(gl.BLEND);
+  gl.useProgram(copyP.p);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, hdrFB.tex);
+  gl.uniform1i(copyP.u.uTex, 0);
+  drawQuad(copyP);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, hdrFB.fb);
+  gl.viewport(0, 0, hdrFB.w, hdrFB.h);
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.CULL_FACE);
+  gl.enable(gl.BLEND);
 }
 
 // ============================================================
@@ -718,39 +785,120 @@ const cubeMesh = uploadMesh(makeCube());
 const floorMesh = uploadMesh(makePlane(30, 20));
 
 // ============================================================
-//  Procedural block texture (bevel + inset + noise)
+//  Procedural textures (piece-specific motifs + bevel + noise)
 // ============================================================
-function makeBlockTextureCanvas() {
-  const c = document.createElement('canvas');
-  c.width = c.height = 128;
-  const ctx = c.getContext('2d');
-  // base — middle grey so multiplication preserves color
-  ctx.fillStyle = '#9a9a9a';
-  ctx.fillRect(0, 0, 128, 128);
-  // diagonal bevel: bright top-left, darker bottom-right
-  const grad = ctx.createLinearGradient(0, 0, 128, 128);
-  grad.addColorStop(0, 'rgba(255,255,255,0.55)');
-  grad.addColorStop(0.5, 'rgba(255,255,255,0)');
-  grad.addColorStop(1, 'rgba(0,0,0,0.45)');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, 128, 128);
-  // outer rim dark frame
-  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
-  ctx.lineWidth = 6;
-  ctx.strokeRect(3, 3, 122, 122);
-  // inner bright inset
-  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(12, 12, 104, 104);
-  // tiny brushed-noise
-  const img = ctx.getImageData(0, 0, 128, 128);
+const BLOCK_TEXTURE_KEYS = ['frame', 'I', 'O', 'T', 'S', 'Z', 'J', 'L'];
+
+function applyCanvasNoise(ctx, size, strength) {
+  const img = ctx.getImageData(0, 0, size, size);
   for (let i = 0; i < img.data.length; i += 4) {
-    const n = (Math.random() - 0.5) * 18;
+    const n = (Math.random() - 0.5) * strength;
     img.data[i]   = Math.max(0, Math.min(255, img.data[i]   + n));
     img.data[i+1] = Math.max(0, Math.min(255, img.data[i+1] + n));
     img.data[i+2] = Math.max(0, Math.min(255, img.data[i+2] + n));
   }
   ctx.putImageData(img, 0, 0);
+}
+
+function strokeMotifLine(ctx, x1, y1, x2, y2, width = 5) {
+  ctx.lineCap = 'round';
+  ctx.lineWidth = width + 2;
+  ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath();
+  ctx.moveTo(x1 + 2, y1 + 2);
+  ctx.lineTo(x2 + 2, y2 + 2);
+  ctx.stroke();
+  ctx.lineWidth = width;
+  ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+}
+
+function drawTextureRivet(ctx, x, y, r = 6) {
+  ctx.fillStyle = 'rgba(0,0,0,0.42)';
+  ctx.beginPath();
+  ctx.arc(x + 1, y + 1, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.22)';
+  ctx.beginPath();
+  ctx.arc(x - 1, y - 1, r * 0.55, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawBlockTextureMotif(ctx, type) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(16, 16, 96, 96);
+  ctx.clip();
+  switch (type) {
+    case 'I':
+      for (let y = 34; y <= 94; y += 20) strokeMotifLine(ctx, 22, y, 106, y, 4);
+      break;
+    case 'O':
+      ctx.strokeStyle = 'rgba(0,0,0,0.38)';
+      ctx.lineWidth = 6;
+      ctx.strokeRect(36, 36, 56, 56);
+      ctx.strokeStyle = 'rgba(255,255,255,0.23)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(42, 42, 44, 44);
+      [[34,34], [94,34], [34,94], [94,94]].forEach(([x, y]) => drawTextureRivet(ctx, x, y, 5));
+      break;
+    case 'T':
+      strokeMotifLine(ctx, 64, 26, 64, 102, 6);
+      strokeMotifLine(ctx, 28, 48, 100, 48, 6);
+      drawTextureRivet(ctx, 64, 64, 7);
+      break;
+    case 'S':
+      for (let y = 34; y <= 94; y += 20) strokeMotifLine(ctx, 28, y, 100, y, 4);
+      drawTextureRivet(ctx, 38, 64, 5);
+      drawTextureRivet(ctx, 90, 64, 5);
+      break;
+    case 'Z':
+      for (let x = 40; x <= 88; x += 24) strokeMotifLine(ctx, x, 30, x, 98, 4);
+      drawTextureRivet(ctx, 64, 38, 5);
+      drawTextureRivet(ctx, 64, 90, 5);
+      break;
+    case 'J':
+      for (let x = 36; x <= 92; x += 18) strokeMotifLine(ctx, x, 28, x, 98, 4);
+      strokeMotifLine(ctx, 30, 96, 96, 96, 5);
+      break;
+    case 'L':
+      strokeMotifLine(ctx, 32, 30, 32, 98, 6);
+      strokeMotifLine(ctx, 32, 98, 100, 98, 6);
+      for (let y = 40; y <= 76; y += 18) strokeMotifLine(ctx, 50, y, 96, y, 3);
+      break;
+    default:
+      strokeMotifLine(ctx, 30, 48, 98, 48, 4);
+      strokeMotifLine(ctx, 30, 80, 98, 80, 4);
+      [[28,28], [100,28], [28,100], [100,100]].forEach(([x, y]) => drawTextureRivet(ctx, x, y, 4));
+      break;
+  }
+  ctx.restore();
+}
+
+function makeBlockTextureCanvas(type = 'frame') {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  // Middle grey keeps the shader texture neutral around the piece color.
+  ctx.fillStyle = '#929292';
+  ctx.fillRect(0, 0, 128, 128);
+  const grad = ctx.createLinearGradient(0, 0, 128, 128);
+  grad.addColorStop(0, 'rgba(255,255,255,0.60)');
+  grad.addColorStop(0.42, 'rgba(255,255,255,0.04)');
+  grad.addColorStop(1, 'rgba(0,0,0,0.48)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 128, 128);
+  applyCanvasNoise(ctx, 128, 18);
+  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  ctx.lineWidth = 6;
+  ctx.strokeRect(3, 3, 122, 122);
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(12, 12, 104, 104);
+  drawBlockTextureMotif(ctx, type);
   return c;
 }
 
@@ -768,15 +916,7 @@ function makeSurfaceTextureCanvas() {
     ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, 256); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(256, i); ctx.stroke();
   }
-  // noise
-  const img = ctx.getImageData(0, 0, 256, 256);
-  for (let i = 0; i < img.data.length; i += 4) {
-    const n = (Math.random() - 0.5) * 30;
-    img.data[i]   = Math.max(0, Math.min(255, img.data[i]   + n));
-    img.data[i+1] = Math.max(0, Math.min(255, img.data[i+1] + n));
-    img.data[i+2] = Math.max(0, Math.min(255, img.data[i+2] + n));
-  }
-  ctx.putImageData(img, 0, 0);
+  applyCanvasNoise(ctx, 256, 30);
   return c;
 }
 
@@ -795,8 +935,17 @@ function makeTexture(src, repeat) {
   return t;
 }
 
-const blockTex = makeTexture(makeBlockTextureCanvas(), false);
+const blockTextureCanvases = {};
+const blockTextures = {};
+for (const type of BLOCK_TEXTURE_KEYS) {
+  blockTextureCanvases[type] = makeBlockTextureCanvas(type);
+  blockTextures[type] = makeTexture(blockTextureCanvases[type], false);
+}
 const surfaceTex = makeTexture(makeSurfaceTextureCanvas(), true);
+
+function getBlockTexture(type) {
+  return blockTextures[type] || blockTextures.frame;
+}
 
 // Vertical wall (XY plane, normal +Z)
 function makeWall(w, h) {
@@ -1010,7 +1159,7 @@ function bindLitMesh(mesh) {
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.idxBuf);
 }
 
-function drawLitCube(x, y, z, sx, sy, sz, color, emissive, opacity, vp, camPos) {
+function drawLitCube(x, y, z, sx, sy, sz, color, emissive, opacity, glass = 0.0) {
   M4.identity(tmpModel);
   M4.translate(tmpModel, tmpModel, x, y, z);
   M4.scale(tmpModel, tmpModel, sx, sy, sz);
@@ -1020,6 +1169,7 @@ function drawLitCube(x, y, z, sx, sy, sz, color, emissive, opacity, vp, camPos) 
   gl.uniform3fv(litP.u.uColor, color);
   gl.uniform3fv(litP.u.uEmissive, emissive);
   gl.uniform1f(litP.u.uOpacity, opacity);
+  gl.uniform1f(litP.u.uGlass, glass);
   gl.drawElements(gl.TRIANGLES, cubeMesh.count, gl.UNSIGNED_SHORT, 0);
 }
 
@@ -1071,17 +1221,17 @@ function setLitGlobals(camPos) {
 // Iterate every cube that should cast & receive shadows
 function forEachCubeOccluder(cb) {
   const t = 0.3, fc = [0.95, 0.78, 0.0], fe = [0.25, 0.15, 0.0];
-  cb(0, -ROWS/2 - t/2, 0, COLS + t, t, t, fc, fe);
-  cb(0,  ROWS/2 + t/2, 0, COLS + t, t, t, fc, fe);
-  cb(-COLS/2 - t/2, 0, 0, t, ROWS + t, t, fc, fe);
-  cb( COLS/2 + t/2, 0, 0, t, ROWS + t, t, fc, fe);
+  cb(0, -ROWS/2 - t/2, 0, COLS + t, t, t, fc, fe, 'frame');
+  cb(0,  ROWS/2 + t/2, 0, COLS + t, t, t, fc, fe, 'frame');
+  cb(-COLS/2 - t/2, 0, 0, t, ROWS + t, t, fc, fe, 'frame');
+  cb( COLS/2 + t/2, 0, 0, t, ROWS + t, t, fc, fe, 'frame');
   const ox = -(COLS - 1) / 2, oy = (ROWS - 1) / 2;
   for (let y = 0; y < ROWS; y++) {
     for (let x = 0; x < COLS; x++) {
       const c = board[y][x];
       if (c) {
         const col = COLORS[c];
-        cb(ox + x, oy - y, 0, 0.92, 0.92, 0.92, col, [col[0]*0.2, col[1]*0.2, col[2]*0.2]);
+        cb(ox + x, oy - y, 0, 0.92, 0.92, 0.92, col, [col[0]*0.2, col[1]*0.2, col[2]*0.2], c);
       }
     }
   }
@@ -1090,7 +1240,7 @@ function forEachCubeOccluder(cb) {
       for (let x = 0; x < current.shape[y].length; x++) {
         if (current.shape[y][x]) {
           const col = COLORS[current.type];
-          cb(ox + current.x + x, oy - (current.y + y), 0, 0.92, 0.92, 0.92, col, [col[0]*0.35, col[1]*0.35, col[2]*0.35]);
+          cb(ox + current.x + x, oy - (current.y + y), 0, 0.92, 0.92, 0.92, col, [col[0]*0.35, col[1]*0.35, col[2]*0.35], current.type);
         }
       }
     }
@@ -1219,6 +1369,7 @@ function render(time) {
   gl.uniform3fv(litP.u.uColor, [0.015, 0.015, 0.035]);
   gl.uniform3fv(litP.u.uEmissive, [0, 0, 0]);
   gl.uniform1f(litP.u.uOpacity, 1.0);
+  gl.uniform1f(litP.u.uGlass, 0.0);
   gl.drawElements(gl.TRIANGLES, floorMesh.count, gl.UNSIGNED_SHORT, 0);
 
   // Back wall
@@ -1231,37 +1382,26 @@ function render(time) {
   gl.uniform3fv(litP.u.uColor, [0.015, 0.015, 0.035]);
   gl.uniform3fv(litP.u.uEmissive, [0, 0, 0]);
   gl.uniform1f(litP.u.uOpacity, 1.0);
+  gl.uniform1f(litP.u.uGlass, 0.0);
   gl.drawElements(gl.TRIANGLES, wallMesh.count, gl.UNSIGNED_SHORT, 0);
 
-  // Cubes (frame + board + current piece) — block texture
+  // Frame cubes stay opaque; glass pieces render after the refraction snapshot.
   gl.activeTexture(gl.TEXTURE1);
-  gl.bindTexture(gl.TEXTURE_2D, blockTex);
   gl.uniform1f(litP.u.uUseTexture, 1.0);
   gl.uniform2fv(litP.u.uUVScale, [1, 1]);
   bindLitMesh(cubeMesh);
-  forEachCubeOccluder((x, y, z, sx, sy, sz, color, emissive) => {
-    drawLitCube(x, y, z, sx, sy, sz, color, emissive, 1.0);
+  let activeBlockTexture = null;
+  forEachCubeOccluder((x, y, z, sx, sy, sz, color, emissive, textureType) => {
+    if (textureType !== 'frame') return;
+    const tex = getBlockTexture(textureType);
+    if (tex !== activeBlockTexture) {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      activeBlockTexture = tex;
+    }
+    drawLitCube(x, y, z, sx, sy, sz, color, emissive, 1.0, 0.0);
   });
 
-  // Ghost piece (non-occluder, no texture)
-  if (current && !gameOver) {
-    gl.uniform1f(litP.u.uUseTexture, 0.0);
-    let gy = 0;
-    while (!collides(current, 0, gy + 1)) gy++;
-    const ox = -(COLS - 1) / 2, oy = (ROWS - 1) / 2;
-    gl.depthMask(false);
-    for (let y = 0; y < current.shape.length; y++) {
-      for (let x = 0; x < current.shape[y].length; x++) {
-        if (current.shape[y][x]) {
-          const col = COLORS[current.type];
-          drawLitCube(ox + current.x + x, oy - (current.y + y + gy), 0, 0.9, 0.9, 0.9, col, [0,0,0], 0.18);
-        }
-      }
-    }
-    gl.depthMask(true);
-  }
-
-  // --- Unlit pass: grid lines ---
+  // Grid is part of the background snapshot, so it bends inside glass.
   gl.useProgram(unlitP.p);
   gl.uniformMatrix4fv(unlitP.u.uVP, false, vpMat);
   M4.identity(tmpModel);
@@ -1274,6 +1414,58 @@ function render(time) {
   gl.vertexAttribPointer(unlitP.a.aPos, 3, gl.FLOAT, false, 0, 0);
   gl.drawArrays(gl.LINES, 0, gridLines.count);
 
+  copySceneForRefraction();
+
+  gl.useProgram(litP.p);
+  setLitGlobals(camPos);
+  gl.uniformMatrix4fv(litP.u.uShadowVP, false, shadowVPMat);
+  gl.uniform2fv(litP.u.uShadowTexel, [1 / SHADOW_SIZE, 1 / SHADOW_SIZE]);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+  gl.uniform1i(litP.u.uShadowMap, 0);
+  gl.uniform1i(litP.u.uTexture, 1);
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, refractFB.tex);
+  gl.uniform1i(litP.u.uSceneTexture, 2);
+  gl.uniform2fv(litP.u.uSceneTexel, [1 / refractFB.w, 1 / refractFB.h]);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.uniform1f(litP.u.uUseTexture, 1.0);
+  gl.uniform2fv(litP.u.uUVScale, [1, 1]);
+  bindLitMesh(cubeMesh);
+  activeBlockTexture = null;
+  gl.depthMask(false);
+  forEachCubeOccluder((x, y, z, sx, sy, sz, color, emissive, textureType) => {
+    if (textureType === 'frame') return;
+    const tex = getBlockTexture(textureType);
+    if (tex !== activeBlockTexture) {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      activeBlockTexture = tex;
+    }
+    drawLitCube(x, y, z, sx, sy, sz, color, emissive, 0.74, 1.0);
+  });
+  gl.depthMask(true);
+
+  // Ghost piece (non-occluder, translucent texture)
+  if (current && !gameOver) {
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, getBlockTexture(current.type));
+    gl.uniform1f(litP.u.uUseTexture, 1.0);
+    gl.uniform2fv(litP.u.uUVScale, [1, 1]);
+    let gy = 0;
+    while (!collides(current, 0, gy + 1)) gy++;
+    const ox = -(COLS - 1) / 2, oy = (ROWS - 1) / 2;
+    gl.depthMask(false);
+    for (let y = 0; y < current.shape.length; y++) {
+      for (let x = 0; x < current.shape[y].length; x++) {
+        if (current.shape[y][x]) {
+          const col = COLORS[current.type];
+          drawLitCube(ox + current.x + x, oy - (current.y + y + gy), 0, 0.9, 0.9, 0.9, col, [0,0,0], 0.24, 1.0);
+        }
+      }
+    }
+    gl.depthMask(true);
+  }
+
   // Particles
   gl.useProgram(litP.p);
   setLitGlobals(camPos);
@@ -1281,6 +1473,7 @@ function render(time) {
   gl.uniform2fv(litP.u.uShadowTexel, [1 / SHADOW_SIZE, 1 / SHADOW_SIZE]);
   gl.uniform1i(litP.u.uShadowMap, 0);
   gl.uniform1f(litP.u.uUseTexture, 0.0);
+  gl.uniform1f(litP.u.uGlass, 0.0);
   bindLitMesh(cubeMesh);
   gl.depthMask(false);
   for (const p of particles) {
@@ -1360,24 +1553,58 @@ function drawNext() {
   const hex = `rgb(${Math.round(c[0]*255)},${Math.round(c[1]*255)},${Math.round(c[2]*255)})`;
   for (let y = 0; y < sh.length; y++)
     for (let x = 0; x < sh[y].length; x++)
-      if (sh[y][x]) draw3DCell(offX + x * size, offY + y * size, size, hex);
+      if (sh[y][x]) draw3DCell(offX + x * size, offY + y * size, size, hex, next.type);
 }
-function draw3DCell(x, y, s, color) {
+function draw3DCell(x, y, s, color, type) {
   const dx = 4, dy = 4;
-  nctx.fillStyle = shade(color, 25);
+  const glassEdge = rgbaFromRgb(shade(color, 35), 0.78);
+  const glassSide = rgbaFromRgb(shade(color, -35), 0.56);
+  nctx.fillStyle = glassEdge;
   nctx.beginPath();
   nctx.moveTo(x, y); nctx.lineTo(x + dx, y - dy);
   nctx.lineTo(x + s + dx, y - dy); nctx.lineTo(x + s, y);
   nctx.closePath(); nctx.fill();
-  nctx.fillStyle = shade(color, -25);
+  nctx.fillStyle = glassSide;
   nctx.beginPath();
   nctx.moveTo(x + s, y); nctx.lineTo(x + s + dx, y - dy);
   nctx.lineTo(x + s + dx, y + s - dy); nctx.lineTo(x + s, y + s);
   nctx.closePath(); nctx.fill();
-  nctx.fillStyle = color;
+  const frontGrad = nctx.createLinearGradient(x, y, x + s, y + s);
+  frontGrad.addColorStop(0, rgbaFromRgb('#ffffff', 0.48));
+  frontGrad.addColorStop(0.3, rgbaFromRgb(color, 0.52));
+  frontGrad.addColorStop(1, rgbaFromRgb(shade(color, -45), 0.34));
+  nctx.fillStyle = frontGrad;
   nctx.fillRect(x, y, s, s);
-  nctx.strokeStyle = 'rgba(0,0,0,0.4)';
+  drawPreviewTexture(x, y, s, type);
+  nctx.strokeStyle = 'rgba(255,255,255,0.62)';
+  nctx.lineWidth = 1.5;
+  nctx.beginPath();
+  nctx.moveTo(x + 3, y + 4);
+  nctx.lineTo(x + s - 5, y + 4);
+  nctx.stroke();
+  nctx.strokeStyle = 'rgba(0,0,0,0.30)';
+  nctx.lineWidth = 1;
   nctx.strokeRect(x, y, s, s);
+}
+function drawPreviewTexture(x, y, s, type) {
+  const tex = blockTextureCanvases[type] || blockTextureCanvases.frame;
+  nctx.save();
+  nctx.beginPath();
+  nctx.rect(x + 1, y + 1, s - 2, s - 2);
+  nctx.clip();
+  nctx.globalAlpha = 0.34;
+  nctx.globalCompositeOperation = 'multiply';
+  nctx.drawImage(tex, x, y, s, s);
+  nctx.globalAlpha = 0.38;
+  nctx.globalCompositeOperation = 'screen';
+  nctx.fillStyle = '#fff';
+  nctx.fillRect(x + 3, y + 3, s - 6, 4);
+  nctx.restore();
+}
+function rgbaFromRgb(rgb, alpha) {
+  if (rgb === '#ffffff') return `rgba(255,255,255,${alpha})`;
+  const m = rgb.match(/\d+/g).map(Number);
+  return `rgba(${m[0]},${m[1]},${m[2]},${alpha})`;
 }
 function shade(rgb, amt) {
   const m = rgb.match(/\d+/g).map(Number);
